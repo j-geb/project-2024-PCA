@@ -1,0 +1,655 @@
+---
+title: "Principal Component Analysis Framework for pXRF Data"
+subtitle: "Consultants: Jeremy Gebrael, Shervin Faeghi, Vince Tafea"
+author: ""
+date: "`r Sys.Date()`"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    code-tools: true
+    toc: true
+    code-overflow: scroll
+    theme: sandstone
+    code-block-bg: true
+    code-block-border-left: "dodgerblue"
+---
+
+## Executive Summary
+
+pXRF data was provided to complete a Principal Component Analysis (PCA). The purpose of this report is to demonstrate an exemplar workflow that the client may use when analysing their final dataset (independent from the one provided). They aim to investigate the development of brick making in the early stages of Australian colonisation as a byproduct of social enterprise (1788 - 1840). The file and subsequent code provided has been created in the RStudio environment using R. Explanatory comments have been added to each code block, which can be viewed using the unfold toggle. The code is intended to be run sequentially; ensure all previous code blocks have been run before trying to run an independent chunk. 
+
+## Background
+
+We conducted an illustrative PCA, as shown below. Interpretation and explanations can be found under `Analysis`. However, we note that the primary motivation of our report is to give the client an idea of how to conduct a PCA. Thus, of particular interest to the client is our section *“How to conduct a PCA"*.
+
+ > *Scientific Problem:* The client is investigating brick samples in early colonial Australia (1788–1840). A standard in the field is PCA, hence the client would like guidance in how to conduct this analysis using R code.
+
+ > *Statistical Approach:* We conduct a PCA on the sample data, but also present a ‘cookbook’ that can guide the client in their actual analysis. Moreover, interpretation of PCA is challenging and as such we briefly interpret the illustrative PCA as well as provide extra useful resources.
+
+
+## Data Structure and Cleaning
+
+The provided example dataset comprises of 24 independent brick specimens. With the exception of 3 specimen which were only measured 3 times, the remaining 20 were measured with 10 replicates, giving 219 readings in total. The following code is how to read in the data and remove the last 3 specimen with less measurements. We opt to remove these observations to maintain consistency in the data, leaving 210 rows which is assumably enough to capture real trends. However, this obviously removes some information and one may choose to retain these instead.
+
+```{r, message=FALSE}
+# Libraries used for analysis; need to be downloaded locally
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(dplyr)
+library(plotly)
+library(psych)
+library(corrplot)
+library(factoextra)
+```
+
+```{r, warning=FALSE}
+data <- read_excel("data.xlsx")   #Load in data; must be in same folder as .qmd
+
+#Coding is made a bit easier with consistent naming;
+data <- clean_names(data)  
+colnames(data) <- gsub("_concentration$", "", colnames(data)) 
+
+#Remove last 3 specimen i.e. the ones with less than 10 observations
+data <- data %>% group_by(bricc_standard_name) %>% filter(n() >= 10) %>% ungroup()
+
+data <- data %>% filter(!is.na(test_no))  #remove NA rows
+MDL <- data[data$test_no == "Minimal Detection Limit", ] #extracting all MDL for later
+MDL <- MDL %>% mutate(across(3:ncol(.), ~ round(as.numeric(.)))) #this turns them into whole numbers for consistency in measurements
+
+#Remove the rows that are calculating sample statistics by making them NA and then removing NA
+data$test_no <- as.numeric(data$test_no)
+data <- data %>% filter(!is.na(test_no))
+
+#Change variable type; factor basically means categorical variable
+data <- data %>% mutate(bricc_standard_name = as.factor(bricc_standard_name))
+```
+
+After some preliminary cleaning, we are left with the following column names. We assume based on the consultation that the final dataset will have the same elements listed.
+
+```{r}
+print(colnames(data), quote = FALSE)
+```
+
+The instrument used for these measurements is the Olympus Vanta tool. The instrument maintains a minimum range of eligible readings. If a certain reading is less than this range, the measurement reading is returned as less than Limit of Detection, or within the dataset as “`<LOD`”. This is exemplified in the Uranium (`u`) column:
+
+```{r, message=FALSE}
+tibble(u = head(data$u))
+```
+
+There is also an issue regarding the Lead (`pb`) values, given its shielding properties to radiation and x-rays. The equipment is only able to give a minimum amount of Lead detected, which may still be valuable and potentially interesting.
+
+```{r, , message=FALSE}
+tibble(pb = head(data$pb))
+```
+
+
+Based on studies provided by the client (*Hsieh & Fischer* (2019), *Mitchell et al.* (2012) and *Xu et al* (2019)) as well as further discussions, the following imputation scheme will be used for non-numeric values.
+
+- When an entire column of concentration measurements are `<LOD`: impute as zero (highly likely that the element is simply not present).
+- Singleton detection (only one replicate ≥ LOD out of 10): Exclude the brick from further analysis, as a single detection is insufficient to compute MDL. 
+- Mixed replicates (some ≥ LOD, some `<LOD`): impute each `<LOD` reading with the brick’s Minimal Detection Limit (MDL).
+- `pb` concentration will take the minimum range specified. 
+
+
+
+```{r}
+data_clean <- data  #copy dataframe
+
+#Special rule for pb
+if ("pb" %in% colnames(data)) {
+  data$pb <- gsub("^>", "", data$pb)
+}
+
+#Steps for imputation:
+#1. Identify key columns
+id_cols <- c("bricc_standard_name", "test_no")
+concentration_cols <- setdiff(names(data), id_cols)
+
+#2. Identify <LOD locations per element column (TRUE if <LOD)
+is_lod <- data[concentration_cols] == "<LOD"
+
+#3. Replace <LOD with NA and convert all to numeric
+data_clean[concentration_cols] <- lapply(data[concentration_cols], function(col) {
+  suppressWarnings(as.numeric(replace(col, col == "<LOD", NA)))
+})
+
+#4. Add MDL info by joining on bricc_standard_name
+MDL_renamed <- MDL %>%
+  rename_with(~ paste0(., "_MDL"), .cols = -bricc_standard_name)
+
+data_with_mdl <- left_join(data_clean, MDL_renamed, by = "bricc_standard_name")
+
+
+#5. Apply imputation rules for each element
+for (col in concentration_cols) {
+  non_lod_counts <- data_clean %>%
+    group_by(bricc_standard_name) %>%
+    summarise(non_lod = sum(!is.na(.data[[col]])), .groups = "drop")
+
+  lod_mask <- data[[col]] == "<LOD"
+
+  for (i in which(lod_mask)) {
+    bname <- data_clean$bricc_standard_name[i]
+    n_non_lod <- non_lod_counts$non_lod[non_lod_counts$bricc_standard_name == bname]
+    mdl_val <- data_with_mdl[[paste0(col, "_MDL")]][i]
+
+    if (length(n_non_lod) == 0 || is.na(n_non_lod)) next
+    if (n_non_lod == 0) {
+      
+      data_clean[[col]][data_clean$bricc_standard_name == bname] <- 0 #All values are <LOD for that brick
+    } else if (n_non_lod == 1) {
+      
+  data_clean[[col]][data_clean$bricc_standard_name == bname] <- 0 #Set entire column for that brick to 0
+  next
+    } else {
+      data_clean[[col]][i] <- mdl_val #More than one — use MDL (from MDL table before)
+    }
+  }
+}
+
+#Final result: data_clean with imputed values and original columns preserved
+```
+
+```{r}
+glimpse(data_clean)   #quick look at new clean data
+```
+
+
+
+## Analysis
+
+### Preliminaries
+
+Since the client is mainly interested in the workflow of PCA, we put this as the focus of our report. Briefly, PCA is a statistical method of reducing the dimension of a large dataset (as with the elemental composition of bricks here, which is now 210 rows by 32 columns). It does this by finding the “principal components” (PC) that preserve as much information from the original data as possible. Obviously, some accuracy is sacrificed for interpretability in this sense. The mathematical interpretation can be omitted from a basic understanding. Essentially, these principal components are a combination of the original variables after a linear transformation. 
+
+For a PCA, we assume the direction of a certain linear combination of variables with the most variance (conventionally labelled "PC1") as the most informative. As such, there is a further inherent assumption of the linearity of variables to have a useful PCA.
+
+### Aggregation
+
+Given the purpose of the investigation is to highlight compositional differences and infer from this the inherent development trends in brick development, it is integral to consider the PCA input as a form of aggregation (way to summarise data). The aggregated **median** used as the PCA input will ensure the PCA captures each brick’s typical composition, being the central value, rather than possibly being skewed by the imputed, extreme or missing values.
+
+Furthermore, when considering the methodological approach of using the handheld XRF measurement tool, they are inherently prone to producing two major errors which affects the reliability of the data:
+
+- *Surface irregularities:* Rough or uneven surfaces of the bricks scatter the X-rays unpredictably, leading to readings of inconsistent and/or extreme values (*Mitchell*, 2012). 
+- *Instrument noise and signal to noise fluctuations:* Handheld XRF detectors, such as the Olympus Vanta, are sensitive to both random electronic noises inherent to the device and background noise, especially at lower concentrations (*Portaspecs*, 2025). Hence, this is a consideration for how your device is collecting data. 
+
+As such, the median aggregation allows us to manage these potential errors. The following properties account for these errors:
+
+- *Centrality of range:* Medians are an effective method to deal with extreme values, which would otherwise skew mean-based aggregation. 
+- *Actual variability:* Expanding on the centrality, inputting the median of the range would reflect each brick’s genuine composition and allow the effective management of the noise caused by extremes.
+
+*So what about the mean?*
+
+> For instance, when we consider the *Nd* Concentration for the `MNC-1` brick (which is not missing any values) the mean is 301, but the median is 286. Although this difference may seem minor, it illustrates how only a couple outliers can skew the mean distribution. Hence, subtly influencing the results of the PCA. As opposed to the median, which is effectively anchored and not influenced by these outliers. Furthermore, the greater the number of missing values, the more robust and effective capturing the median is. Consider the *Nd* Concentration readings for the `YOK-1` brick sample, with only 4 replicate readings, the median of this is 179, compared to a mean of 195.
+
+### Running PCA
+
+The `prcomp` function in R easily computes the PCA for you. It requires a numeric input, and the decision whether to scale or not. This process brings otherwise negligibly small concentrations into consideration for the entire composition of a brick.
+
+```{r}
+#Step 1: Compute brick-level medians (excluding test_no)
+medians <- data_clean %>%
+  select(-test_no) %>%
+  group_by(bricc_standard_name) %>%
+  summarise(across(where(is.numeric), ~ median(.x, na.rm = TRUE)), .groups = "drop")
+
+#Step 2: Get into all numeric mode for PCA and remove constant variance columns (excluding the ID column)
+pca_input <- medians %>%
+  select(-bricc_standard_name)
+
+pca_input_clean <- pca_input[, sapply(pca_input, function(col) {
+  is.numeric(col) && all(!is.na(col)) && sd(col, na.rm = TRUE) > 0
+})]
+
+#Step 3: Run PCA
+results <- prcomp(pca_input_clean, scale. = TRUE)
+```
+
+The scaling can be viewed more in-depth using the following sequence of boxplots. The size of each box being roughly similar supports the notion that the distributions are similar.
+
+```{r}
+#Use the function "scale" and ggplot to visualise
+pca_scaled <- scale(pca_input_clean) %>% as.data.frame()
+pca_long <- pca_scaled %>% pivot_longer(everything(), names_to = "Element", values_to = "Z_score")
+
+p1 <- ggplot(pca_long, aes(x = Element, y = Z_score)) + geom_boxplot() + theme_minimal() + theme(axis.text.x = element_text(angle = 90)) + labs(title = "Standardised Distributions of Composition", x = "Element")
+
+#Display
+p1
+```
+**Figure 1. Distribution of each element under standardisation. The outliers (the dots on the plot) are moderate, but PCA can handle this fine.**
+
+A correlation heatmap can further support the idea of PCA.
+
+```{r}
+cor_matrix <- cor(pca_input_clean, use = "pairwise.complete.obs")   #from "corrplot" package
+
+#Plotly allows us to make this interactive; useful for purposes of this report but obviously not so much for writing a paper
+p2 <- plot_ly(x = colnames(cor_matrix), y = rownames(cor_matrix), z = cor_matrix, type = "heatmap", colors = colorRamp(c("maroon", "white", "dodgerblue4")), zmin = -1, zmax = 1)  %>% 
+  layout(title = list(text = "Correlation Heatmap"))
+
+#Display
+p2
+```
+**Figure 2. Correlation heatmap showing the strength and direction of linear relationships between elemental concentrations.**
+
+Stronger coloured tiles are ideal as it indicates strong correlations which suggests redundancy in information across variables (i.e., variation can be captured in fewer principal components). For this data, PCA is clearly suitable, but not perfect.
+
+
+### Scree Plot
+
+```{r}
+p3 <- fviz_eig(results, addlabels = TRUE)   #factoextra package has a nice visual for this
+p3
+```
+**Figure 3. PCA Scree plot. Clearly, PC1 and PC2 account for a large majority of the data set (exactly 50%), but miss out on a large portion of accuracy.**
+
+A so-called scree plot is also useful to look at. Fittingly, scree refers to the stones on the side of a mountain, decreasing in height from the peak. The plot has a similar look, which tells us how much of the variance in the original data is explained by each principal component.  The heuristic in choosing the number of dimensions is to look for a drop off in variance explained, which can be seen between 2 and 3 dimensions.
+
+
+
+### Scores
+
+```{r}
+scores <- as.data.frame(results$x[, 1:2])   #takes first 2 columns (PC1, PC2)
+scores$brick <- medians$bricc_standard_name   #adds new column "brick" which is just the name of the brick
+
+p4 <- plot_ly(data = scores,  x = ~PC1, y = ~PC2,
+  type = "scatter", mode = "markers+text",
+  text = ~brick, textposition = "top center",
+  marker = list(color = 'black'),
+  name = "Bricks") %>% 
+  layout(title = "PCA Scores (Bricks)",xaxis = list(title = "PC1"),yaxis = list(title = "PC2"))
+
+#Display
+p4
+```
+**Figure 4. PCA score for each brick using first two principal components. The hover text reveals the x and y coordinates which  are values of PC1 and PC2, respectively.**
+
+The subsequent scatter plot takes the two most explainable principal components (PC1 and PC2), and plots each brick against them. Typically, only two principal components are chosen in this field as it gives the most basic understanding in 2 dimensions. This gives a ‘score’ for each brick, as explained by only two components.
+
+
+
+### Loadings
+
+Similarly, taking the 2-dimensional model, we can find the loadings. The loadings indicate how much of each original variable (i.e. concentrations) contribute to a principal component (PC1 and PC2 in this case). 
+
+```{r}
+loadings <- as.data.frame(results$rotation[, 1:2])   #first 2 columns once more
+loadings$element <- rownames(results$rotation)   #naming column of elements
+
+arrow_head_ratio <- 0.0075    # fraction of the arrow vector length used for the arrowhead length
+arrow_width_ratio  <- 0.006   # fraction for half the width of the arrowhead
+
+#Creating the arrow for visual purposes
+arrow_shapes <- list()
+for (i in 1:nrow(loadings)) {   #Loop over each row in loadings
+  x_end <- loadings$PC1[i]
+  y_end <- loadings$PC2[i]   #Endpoint of the arrow (from PCA loadings)
+  theta <- atan2(y_end, x_end)   #Angle (radians)
+  vec_length <- sqrt(x_end^2 + y_end^2)   #Length of arrow
+  head_length <- arrow_head_ratio * vec_length   #Head length
+  head_width  <- arrow_width_ratio * vec_length   #Head width
+  x_base <- x_end - head_length * cos(theta)   #Base of arrow head
+  y_base <- y_end - head_length * sin(theta)
+  
+  #Creating the shape
+  line_shape <- list(
+    type = "line",
+    x0 = 0, y0 = 0,
+    x1 = x_base, y1 = y_base,
+    line = list(color = "red", width = 2)
+  )
+
+  x_corner1 <- x_base + head_width * sin(theta)
+  y_corner1 <- y_base - head_width * cos(theta)
+  x_corner2 <- x_base - head_width * sin(theta)
+  y_corner2 <- y_base + head_width * cos(theta)
+  path_string <- sprintf("M %f,%f L %f,%f L %f,%f Z", x_end, y_end, x_corner1, y_corner1, x_corner2, y_corner2)
+  
+  arrow_head_shape <- list(type = "path", path = path_string, fillcolor = "red", line = list(color = "red", width = 2))
+
+  arrow_shapes <- c(arrow_shapes, list(line_shape, arrow_head_shape))  #Append both the line and the arrowhead
+}
+
+#Creating scatter plot of loading vectors
+p5 <- plot_ly(type = "scatter", mode = "text", x = loadings$PC1, y = loadings$PC2, text = loadings$element,
+  textposition = "top center",
+  hoverinfo = "text",
+  showlegend = FALSE) %>%
+  layout(title = "PCA Loadings (Element Concentrations)", xaxis = list(title = "PC1"), yaxis = list(title = "PC2"), shapes = arrow_shapes)
+
+#Display
+p5
+```
+
+**Figure 5. Loading vectors in 2D.**
+
+
+### Biplot 
+
+Placing both plots on the same scale is often a useful preliminary look before clustering.
+
+```{r}
+rownames(results$x) <- medians$bricc_standard_name   #gives actual pca rownames consistent naming
+
+p6 <- fviz_pca_biplot(results)   #again, factoextra helpful here
+ggplotly(p6, tooltip = "text")   #to give the ability to zoom
+```
+**Figure 6. Scores and Loadings on same 'biplot' to see emerging clusters. Note, blue is used for the loadings in this case to emphasise the fact that they were scaled to match the scores. This preserves the PC direction so is acceptable with the correct interpretation (i.e., magnitude becomes meaningless).**
+
+### Statistical Tests
+
+A common statistical test that accompanies PCA is the Kaiser-Meyer-Olkin (KMO) test. This can be used to see suitability of PCA. The following is the output from running this test (from the `psych` library):
+
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+kmo <- KMO(pca_input_clean)   #pysch package
+kmo$MSA   #extract the MSA
+```
+
+The **overall MSA** is what is really of importance here. For this data, 0.5 indicates poor sampling adequacy for this analysis. Values closer to 1 are ideal, and anything less than 0.5 is unacceptable. 
+
+If there is difficultly interpreting the scree plot, we may also look at eigenvalues to determine choice of dimensions. The Kaiser Criterion says to retain components with eigenvalue greater than 1. With our data, this number is:
+
+```{r}
+eigenvalues <- (results$sdev)^2
+sum(eigenvalues > 1)
+```
+As is often the case, the criterion seems to overestimate the number of components.
+
+
+### Further Analysis
+
+As a final note in the analysis component of this report, we include this section in the case that PCA does not yield meaningful results on the final data. If the client requires a greater proportion of variance to be explained, the analysis could be extended to include the top three principal components instead of just two.
+
+```{r, warning=FALSE, message=FALSE}
+scores_3d <- as.data.frame(results$x[, 1:3])  #first 3 columns; PC1 to PC3
+scores_3d$brick <- medians$bricc_standard_name   #adding the name column
+
+loadings_3d <- as.data.frame(results$rotation[, 1:3])   #associated loadings for 3 columns
+loadings_3d$element <- rownames(loadings)   #element names
+scale_factor <- 15   #adjust as needed
+loadings_scaled <- loadings_3d
+loadings_scaled[, 1:3] <- loadings_scaled[, 1:3] * scale_factor
+
+
+#Main 3D scatter with brick labels
+p7 <- plot_ly(scores_3d, x = ~PC1, y = ~PC2, z = ~PC3,
+               type = 'scatter3d', mode = 'markers+text',
+               text = ~brick, 
+               marker = list(size = 3),
+               textposition = 'top center',
+               hoverinfo = 'text')
+
+#Add loading vectors as arrows as before (p5)
+for (i in 1:nrow(loadings_scaled)) {
+  p7 <- p7 %>% add_trace(
+      type = 'scatter3d', mode = 'lines+text',
+      x = c(0, loadings_scaled$PC1[i]),
+      y = c(0, loadings_scaled$PC2[i]),
+      z = c(0, loadings_scaled$PC3[i]),
+      line = list(color = 'red', width = 4),
+      text = loadings_scaled$element[i],
+      textposition = 'top center',
+      hoverinfo = 'text',
+      showlegend = FALSE
+    )
+}
+
+p7 <- p7 %>% layout(title = "3D PCA Biplot", scene = list(
+    xaxis = list(title = "PC1"),
+    yaxis = list(title = "PC2"),
+    zaxis = list(title = "PC3")))
+
+#Display
+p7
+```
+**Figure 7. Interactive biplot in 3D. The inclusion of PC3 may reveal additional clustering structures not visible in two dimensions.**
+
+If their is concern over the overall MSA or the general suitability of standard PCA, several alternative versions exist that address specific limitations:
+
+- Robust PCA (from the `robpca` package): if suspected outliers are skewing results, this is the method to use as it reduces their influence on the principal components.
+- CLR-PCA (from the `compositions` package): designed specifically for compositional data, assumes log-transformed data.
+- Nonlinear PCA (from the `princurve` package): removes the regular assumption of linear correlations to potentially explain more variance with less components.
+
+
+
+## Clustering
+
+Another goal that was illustrated during the consultation was the implementation of hierarchical clustering. Other clustering methods exist that may be less common in this domain, however, we will discuss for a holistic understanding.
+
+### Hierarchichal Clustering
+
+From our understanding, hierarchical clustering is a norm in this field. This will group the bricks based on their similarity in a tree-like structure, the dendrogram (seen below). This is the main benefit of this method; we need not specify the number of clusters until after clustering, then we can 'cut' the tree to our desired number.
+
+We may chose to cluster before or after PCA. 
+
+```{r, message=FALSE, warning=FALSE}
+dist_matrix1 <- dist(pca_scaled)   #Euclidean distance matrix for clustering basis using earlier scaled data
+hc1 <- hclust(dist_matrix1, method = "ward.D2")   #may specify another method
+
+#Plot dendrogram
+p8 <- plot(hc1, labels = medians$bricc_standard_name, main = "Dendrogram for Scaled Medians",  xlab = "", sub="")
+p8
+```
+**Figure 8. Hierarchical clustering tree pre-PCA. Gives an idea of the natural clusters in the data.**
+
+
+```{r, warning=FALSE}
+#Same procedure as p8
+rownames(scores) <- medians$bricc_standard_name   #ensures naming is good
+dist_matrix2 <- dist(scores)
+hc2 <- hclust(dist_matrix2, method = "ward.D2")
+
+p9 <- plot(hc2, labels = medians$bricc_standard_name, main = "Dendrogram for PCA Scores", xlab = "", sub="")
+p9
+```
+**Figure 9. Hierarchical clustering tree post-PCA. Clearly, minimal changes occur.**
+
+Note: this uses the `ward.D2` method to find clusters. This minimises total within-cluster variance (recommended and presented in papers provided), however, others do exist for consideration:
+
+- `average`: average linkage.
+- `complete`: Max distance between clusters.
+- `single`: Min distance between clusters.
+
+If we want a more visual application of these clusters, we shift focus onto the PCA space of the two principal components. A silhouette analysis is used to find the optimal number of components. The silhouette width is essentially a ratio of how similar an observation is to others in its cluster compared to other clusters; closer to 1 the better.
+
+```{r, warning=FALSE}
+p10 <- fviz_nbclust(scores, FUN = hcut, method = "silhouette", k.max = 10)   #from factoextra package
+p10
+```
+**Figure 10. Silhouette analysis to find optimal cluster number. This method yields an optimal value of 3 clusters.**
+
+Other methods to decide include: 
+
+- Elbow method (method = "`wss`"): look for sharp corner in total within-cluster variance.
+- Gap Statistic (method = "`gap_stat`"): Compares to null reference data.
+
+Visualising the optimal 3 clusters:
+
+```{r}
+p11 <- fviz_dend(hc2, k = 3, rect = TRUE, show_labels = TRUE, scale=none)   #factoextra package again has a visual for this; k is the number of clusters
+p11
+```
+**Figure 11. PCA dendrogram 'cut' into the 3 clusters found in figure 10.**
+
+
+### K-Means Clustering
+
+```{r}
+p12 <- fviz_nbclust(results$x[, 1:2], kmeans, method = "silhouette", k.max = 10)   #follows hierarchical with different argument; we look at 10 different k values (typically sufficient)
+p12
+```
+**Figure 12. Silhouette analysis for K-means clustering. 4 clusters is optimal.**
+
+
+```{r, message=FALSE, warning=FALSE}
+set.seed(2025)   #centroid random, we set seed for reproducible results
+
+kmeans_result <- kmeans(results$x[, 1:2], centers = 4, nstart = 25)   #running the kmeans with 4 centres, found previously (change as desired)
+
+df <- as.data.frame(results$x[, 1:2])  #new dataframe to assign clusters
+df$cluster <- factor(kmeans_result$cluster)
+df$label <- medians$bricc_standard_name
+df$hover_text <- paste("Brick:", df$label, "<br>Cluster:", df$cluster)
+
+p13 <- ggplot(df, aes(x = PC1, y = PC2, color = cluster, fill = cluster)) +
+  stat_ellipse(geom = "polygon", type = "norm", alpha = 0.2, aes(group = cluster), show.legend = FALSE) +
+  geom_point(aes(text = hover_text), size = 1.5) +  # only here
+  geom_text(aes(label = label), vjust = -0.8, size = 3, show.legend = FALSE) +
+  scale_color_brewer(palette = "Set1") +
+  scale_fill_brewer(palette = "Set1") +
+  theme_minimal() +
+  ggtitle("PCA Scores with K-Means Clustering")
+
+#Display
+ggplotly(p13, tooltip = "text")
+```
+**Figure 13. Using the optimal 4 clusters we create 95% confidence ellipses around them. Note, 2 of the clusters do not have enough points to make such an ellipse, hence may be considered outliers or from a sample. The overlap is attributed to the change in space (calculated in original space and transformed into PC1-PC2 plane).**
+
+
+### Comparison on PCA
+
+```{r, message=FALSE, warning=FALSE}
+clusters <- cutree(hc2, k = 3)   #choose desired number of clusters
+df <- as.data.frame(results$x[, 1:2])  #new dataframe to assign clusters
+df$cluster <- factor(clusters)
+df$label <- medians$bricc_standard_name
+df$hover_text <- paste("Brick:", df$label, "<br>Cluster:", df$cluster)
+
+#Create plot
+p14 <- ggplot(df, aes(x = PC1, y = PC2, color = cluster, fill = cluster)) +
+  stat_ellipse(geom = "polygon", type = "norm", alpha = 0.2,aes(group = cluster), show.legend = FALSE) +
+  geom_point(aes(text = hover_text), size = 1.5) +  # only here
+  geom_text(aes(label = label), vjust = -0.8, size = 3, show.legend = FALSE) +
+  scale_color_brewer(palette = "Set1") +
+  scale_fill_brewer(palette = "Set1") +
+  theme_minimal() 
+
+#Scale the 2D loadings
+loadings_s <- loadings  
+scale_factor <- 20
+loadings_s$PC1 <- loadings$PC1 * scale_factor
+loadings_s$PC2 <- loadings$PC2 * scale_factor
+
+#Display plot
+ggplotly(p14 +  geom_segment(data = loadings_s, 
+               aes(x = 0, y = 0, xend = PC1, yend = PC2),
+               arrow = arrow(length = unit(0.2, "cm")), 
+               color = "dodgerblue",  inherit.aes = FALSE) +
+  geom_text(data = loadings_s, 
+            aes(x = PC1, y = PC2, label = element),
+            color = "dodgerblue", 
+            vjust = -0.5, size = 3,  inherit.aes = FALSE) + 
+    ggtitle("Biplot of Scores and Loadings with Hierarchical Clustering"), tooltip = "text")
+```
+**Figure 14. Biplot from figure 6 combined with clustering labels and confidence ellipses. Note once more, the clusters without ellipses may signify outliers or bricks from a different site (or area of a site), and blue is used for the scaled loadings.**
+
+Other clustering methods to consider:
+
+- Gaussian Mixture Models (GMM): Finds clusters of arbitrary shape, handles noise.
+- DBSCAN (Density-Based Spatial Clustering of Applications with Noise): Probabilistic clustering, allows overlap
+- Spectral Clustering: Uses graph/Laplacian structure; good for non-convex shapes.
+
+
+## How  to run a PCA for your real Archeological data
+::: panel-tabset
+### Additional Resources
+The client may have been able to follow along with our analysis via the code comments and analysis but we made this section to explicitly highlight how to analyse their real data. We also highlight some additional resources that may be useful to the client below:
+
+- [StatQuest: Principal Component Analysis (PCA),Step-by-Step](https://youtu.be/FgakZw6K1QQ?si=XK-YdVoCExH_1XN6) (Fun Accessible Youtube Video on PCA)
+- [Pattern-recognition-by-using-principal-component-analysis-PCA-](https://github.com/AbbasPak/Pattern-recognition-by-using-principal-component-analysis-PCA-) (useful overview of PCA)
+- [Sampling Design & Analysis in Conservation Science: The Practicals](https://shire.science.uq.edu.au/CONS7008/_book/principal-components-analysis.html) (A bit more in-depth PCA guide but with great visualisations)
+
+### Step 1
+**Get your data into ‘tidy’ format in which each row is an observation.**
+
+We did this for the sample data you presented, but it may be difficult to follow our code even with the comments and we took this into account:
+
+- Each row should be a brick observation (1,2,3,4… 10);
+- Each column is a variable (e.g. test_no, brick, elements, qualitative variables);
+- Each cell is a single value (400, 200, 1, Yes, No, Green, 1902, etc.).
+
+### Step 2
+**Decide how you will handle observations with `<LOD`.**
+
+According to the papers given, elements that have a lot of non-numeric (i.e., `<LOD`) values are simply removed from analysis. The decision to impute or remove these values has implications for the aggregation statistic chosen (mean, median, etc.). We recommend that you follow the conventions of your field but we conduct the analysis in the way described by the client in post-consultation correspondence (imputing `<LOD` to zero or MDL depending on number of observations per brick).
+
+**Decide how you will handle observations like `pb` (Lead) which appears to be a categorical value.**
+
+PCA requires numerical values only. So ranges such as >50 (which is the way lead is encoded) cannot be used. The client requested to impute those as the minimal value but this is important to at least note and consider.
+
+At this pre-processing stage, the data should resemble this:
+
+```{r}
+reactable::reactable(data)
+```
+
+
+
+### Step 3
+**Decide upon a statistic for each element to represent each brick.**
+
+We have 10 observations per brick. But we aren’t interested scientifically about how each of these observations differ. That is, the bricks themselves are the unit of analysis and the 10 observations are a way to ensure measurement reliability. Thus, we must decide on a statistic to represent each brick utilising these 10 observations. The main ones to consider are:
+
+**Mean**
+
+- The mean may be used; however, if values are imputed to zero and values > LOD are something like 500 there is large error or skewing of the data.
+- If each brick has a different number of measurements, then consider using a weighted mean (However, if each brick has the same number of samples then this is no concern).
+
+**Median**
+
+- The median is robust to outliers and has the added feature that if >50% of the measurements are `<LOD` (using zero imputation) then the measurement statistic is zero.
+- We recommend this choice for this feature, given the nature of the data.
+
+### Step 4
+**Create a new data frame (keeping it ‘tidy’) in which each row is a brick.**
+
+Now that you have decided on a statistic to represent each brick, you want to create a new dataframe in which each row is a brick, and each variable is represented by this statistic (the test number is not needed anymore).
+
+```{r}
+reactable::reactable(medians)
+```
+
+
+### Step 5
+**Conduct the PCA using the numerical values only.**
+
+A PCA is conducted on the numerical values only and so you will need to remove the brick names.
+
+```{r}
+reactable::reactable(pca_input_clean)
+```
+
+
+### Step 6
+**Graphically annotate your PCA with qualitative variables of interest.**
+
+We weren’t presented with qualitative variables, but the highlighting in the papers given such as the figures below in which the qualitative variable is a kiln sample. This is not part of a PCA, but was flagged something of interest by the client.
+
+![Taken from *W. Xu et al.*, (2019).](Fig1.png)
+
+::: 
+
+
+## Conclusions & Limitations
+
+- As students currently undertaking our own studies, we were time-constrained during this project. Nevertheless, we hope the analysis and reporting presented here will be of value to the client.
+- The sample dataset provided is not representative of the final data intended for analysis. Therefore, interpretations drawn from this report should be viewed with appropriate caution.
+- Our analysis assumes that the final dataset will follow the same structure as the sample (i.e., identical column names, variable naming conventions, and format).
+- Comments and code provided are written with the final dataset in mind and may require adjustments if the structure changes.
+
+
+
+## References & Acknowledgements
+
+- Extensive use of the latest version of [Microsoft Copilot](https://copilot.microsoft.com/) (as of May 2025) was used whilst troubleshooting
+- D. Mitchell et al., (2012) [*Geochemical characterisation of north Asian glazed stonewares: a comparative analysis of NAA, ICP-OES and non-destructive pXRF*](https://static.au.edusercontent.com/files/Rud4U3SJm4g9jOOKIiQdMXUY)
+- Hsieh & Fischer, (2019) [*Japanese or Chinese? Non-invasive analysis of East Asian blue-and-white porcelain*](https://static.au.edusercontent.com/files/IhhZGPFgRl6Ylk1ShL7mjKhS)
+- Jain, S., (2021) [*Limitations, Assumptions Watch-Outs of Principal Component Analysis*](https://codatalicious.medium.com/limitations-assumptions-watch-outs-of-principal-component-analysis-8483ceaa2800)
+- Portaspecs, (2025) [*Why light elements are difficult to measure with portable XRF*](https://www.portaspecs.com/why-light-elements-are-difficult-to-measure-with-portable-xrf/)
+- W. Xu et al., (2019) [*Sourcing qingbai porcelains from the Java Sea Shipwreck: Compositional analysis using portable XRF*](https://static.au.edusercontent.com/files/ty8gB47mF2CcoMOhxapMya26)
+
+
